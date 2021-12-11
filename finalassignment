@@ -1,0 +1,507 @@
+###########################################################
+######## Digital Mktg & Soc Med Analytics Group PJ ########
+###########################################################
+
+# To the team: if you observe any error in loading following libraries, you need to install 
+# libraries before running the code
+# Also don't forget to set your working directory
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(ROCR)
+library(skimr)
+library(caTools)
+library(ggcorrplot)
+library(MatchIt)
+
+##############################################
+########## Step 1: Data Cleaning #############
+##############################################
+#Clear existing data from the environment
+rm(list=ls())
+
+# Load dataset
+df = read.csv("High_Note_data_csv.csv", stringsAsFactors =FALSE)
+
+# Delete all the variables for the post period
+# because it is not useful in building the meaningful model
+df <- select (df, -delta2_friend_cnt, -delta2_avg_friend_age, -delta2_avg_friend_male, 
+            -delta2_friend_country_cnt, -delta2_subscriber_friend_cnt, -delta2_songsListened,
+            -delta2_lovedTracks, -delta2_posts, -delta2_playlists, -delta2_shouts,
+            -delta2_good_country)
+
+# Delete data with NAs
+df <- na.omit(df)
+
+#Delete the first two rows because those are irrelevant
+df = select (df, -net_user)
+
+# Check correlations between ind. var. to judge the unnecessary variables
+library(lares)
+# display only significant correlations (at 5% level)
+# display top 20 couples of variables (by correlation coefficient)
+RankedCrossCorrelations = corr_cross(df, max_pvalue = 0.05, top = 20) 
+RankedCrossCorrelations
+
+# Delete friend_country_cnt, delta1_friend_cnt because those variables are correlated
+# with other factors
+df = select (df, -delta1_friend_country_cnt, -friend_cnt)
+
+#######################################################################################
+## Step 2: Pick up variables that we can use for treatment in propensity score matching
+#######################################################################################
+
+# Split the data into train data and test data
+set.seed(100)
+idx = sample.split(df$adopter, 0.7)
+train = df[idx,]
+test = df[!idx,]
+
+#Conduct a logistics regression on the train data
+logRegModel = glm(adopter ~., data=train, family="binomial") 
+summary(logRegModel)
+
+# Re-run the logistic regression based on the important factors
+logRegModel1 = glm(adopter ~ age 
+                   + male 
+                   + avg_friend_age 
+                   + friend_country_cnt
+                   + subscriber_friend_cnt
+                   + subscriber_friend_cnt
+                   + songsListened
+                   + lovedTracks
+                   + playlists 
+                   + shouts
+                   + delta1_avg_friend_age
+                   + delta1_songsListened
+                   + good_country
+                     , data=train, family="binomial") 
+# Run the logistics regression on the test data
+pred = predict(logRegModel1 , newdata=test, type="response")
+head(pred)
+rocr.pred = prediction(pred, test$adopter)
+str(rocr.pred)
+plot(performance(rocr.pred, "tpr", "fpr"))
+
+AUC = as.numeric(performance(rocr.pred, "auc")@y.values)
+AUC
+# AUC = 0.7322488, meaning the prediction is working
+
+# calculate accuracy of the model
+test = mutate(test, 
+              Actual_adopter = ifelse(adopter == 1,"ActualAdopter","ActualNoAdopter"))
+test = mutate(test, predicted_probability = pred)
+
+cutoff = 0.5
+test = mutate(test, 
+              prediction = ifelse(predicted_probability > cutoff,"Predict_Adopter","Predict_NoAdopter"))
+confusion_matrix = table(test$prediction, test$Actual_adopter)
+confusion_matrix
+TP = confusion_matrix[1,1]
+FN = confusion_matrix[2,1]
+FP = confusion_matrix[1,2]
+TN = confusion_matrix[2,2]
+Accuracy = (TP + TN)/(TP + TN + FP + FN)
+FPR = FP/(FP+TN)
+TPR = TP/(TP+FP)
+TNR = TN/(TN+FP)
+FNR = FN/(FN+TP)
+c(Accuracy, FPR, TPR, TNR, FNR)
+# Accuracy = 0.916969147
+# Decide which variables to focus
+summary(logRegModel1)
+# Selecting the variables that High Note can take action on
+# Choose #subscriber_friend_cnt, songsListened, lovedTracks, 
+# playlists as treatment variables
+
+###################################################################
+########### Step 3: Propensity Score Matching #####################
+###################################################################
+# 1) subscriber_friend_cnt
+summary(df$subscriber_friend_cnt)
+# we can understand that most people don't have subscriber friends
+# therefore, we created an additional variable that shows whether a person has subscriber friends or not
+
+#Split into two groups that "friendsOverAvg" and not
+# 0 represents friend below avg
+
+df.sub.friend = mutate(df, subFriend = ifelse(df$subscriber_friend_cnt>=1,1,0))
+
+# Conduct propensity score matching to create a group with similar traits
+
+matchprocess.sub.friend = matchit(subFriend ~ .
+                       -subscriber_friend_cnt, data = df.sub.friend, method = "nearest", ratio = 1)
+summary(matchprocess.sub.friend)
+# Same number of control & treated group
+
+# Create a dataframe with matched data
+matchdata.sub.friend<- match.data(matchprocess.sub.friend) 
+table(matchdata.sub.friend$adopter)
+table(matchdata.sub.friend$subFriend)
+# We know that the same number of subscribers with premium subscriber friends 
+# and those who has no such friends
+# Also 3177 subscribers out of 19734 subscribers in the dataset are adopters
+
+# Delete variables that are created in the process of propensity score matching
+matchdata.sub.friend <- select(matchdata.sub.friend, -distance, -weights, -subclass)
+View(matchdata.sub.friend)
+
+#Conduct logistic regression on the created dataset
+idx <- sample.split(matchdata.sub.friend$adopter, 0.7)
+md.sub.friend.train = df[idx,]
+md.sub.friend.test = df[!idx,]
+
+mod.sub.friend <- glm(adopter~.,
+                     data = md.sub.friend.train, family="binomial")
+summary(mod.sub.friend)
+
+# Run the logistics regression on the test data
+pred2 = predict(mod.sub.friend , newdata=md.sub.friend.test, type="response")
+head(pred2)
+rocr.pred2 = prediction(pred2, md.sub.friend.test$adopter)
+str(rocr.pred2)
+plot(performance(rocr.pred2, "tpr", "fpr"))
+
+AUC = as.numeric(performance(rocr.pred2, "auc")@y.values)
+AUC
+# AUC = 0.7433872
+
+# calculate accuracy of the model
+md.sub.friend.test = mutate(md.sub.friend.test, 
+              Actual_adopter = ifelse(adopter == 1,"ActualAdopter","ActualNoAdopter"))
+md.sub.friend.test = mutate(md.sub.friend.test, predicted_probability = pred2)
+
+cutoff = 0.5
+md.sub.friend.test = mutate(md.sub.friend.test, 
+              prediction = ifelse(predicted_probability > cutoff,"Predict_Adopter","Predict_NoAdopter"))
+confusion_matrix = table(md.sub.friend.test$prediction, md.sub.friend.test$Actual_adopter)
+confusion_matrix
+TP = confusion_matrix[1,1]
+FN = confusion_matrix[2,1]
+FP = confusion_matrix[1,2]
+TN = confusion_matrix[2,2]
+Accuracy = (TP + TN)/(TP + TN + FP + FN)
+FPR = FP/(FP+TN)
+TPR = TP/(TP+FP)
+TNR = TN/(TN+FP)
+FNR = FN/(FN+TP)
+c(Accuracy, FPR, TPR, TNR, FNR)
+#Accuracy = 0.92402854
+# We understand that, even after excluding the influence of confounding factors,
+# increase in subscriber_friend_cnt has impact on becoming a paid subscriber
+
+#2) songsListened
+# First, we need to figure out the level of songs that subscribers listen
+summary(df$songsListened)
+# mean = 18844
+# construct a propensity score matching model to create a group with above the average listener
+# and below the average listener with other similar characteristics
+# to analyze whether this is a factor of being an adopter
+
+df.songsListened = mutate(df, songsListenedAvg = ifelse(df$songsListened>=18844,1,0))
+
+# Conduct propensity score matching to create a group with similar traits
+
+matchprocess.songsListened = matchit(songsListenedAvg ~ .
+                                  -songsListened, data = df.songsListened, method = "nearest", ratio = 1)
+summary(matchprocess.songsListened)
+# Same number of control & treated group
+
+# Create a dataframe with matched data
+matchdata.songsListened<- match.data(matchprocess.songsListened) 
+table(matchdata.songsListened$adopter)
+table(matchdata.songsListened$songsListenedAvg)
+# We know that the same number of subscribers who listen songs more than average 
+# and those who listen below the average
+# Also 2966 subscribers out of 27648 subscribers in the dataset are adopters
+
+# Delete variables that are created in the process of propensity score matching
+matchdata.songsListened <- select(matchdata.songsListened, -distance, -weights, -subclass)
+View(matchdata.songsListened)
+
+#Conduct logistic regression on the created dataset
+idx <- sample.split(matchdata.songsListened$adopter, 0.7)
+md.songsListened.train = df[idx,]
+md.songsListened.test = df[!idx,]
+
+mod.songsListened <- glm(adopter~.,
+                      data = md.songsListened.train, family="binomial")
+summary(mod.songsListened)
+
+# Run the logistics regression on the test data
+pred3 = predict(mod.songsListened , newdata=md.songsListened.test, type="response")
+head(pred3)
+rocr.pred3 = prediction(pred3, md.songsListened.test$adopter)
+str(rocr.pred3)
+plot(performance(rocr.pred3, "tpr", "fpr"))
+
+AUC = as.numeric(performance(rocr.pred3, "auc")@y.values)
+AUC
+# AUC = 0.7504181
+
+# calculate accuracy of the model
+md.songsListened.test = mutate(md.songsListened.test, 
+                            Actual_adopter = ifelse(adopter == 1,"ActualAdopter","ActualNoAdopter"))
+md.songsListened.test = mutate(md.songsListened.test, predicted_probability = pred3)
+
+cutoff = 0.5
+md.songsListened.test = mutate(md.songsListened.test, 
+                            prediction = ifelse(predicted_probability > cutoff,"Predict_Adopter","Predict_NoAdopter"))
+confusion_matrix = table(md.songsListened.test$prediction, md.songsListened.test$Actual_adopter)
+confusion_matrix
+TP = confusion_matrix[1,1]
+FN = confusion_matrix[2,1]
+FP = confusion_matrix[1,2]
+TN = confusion_matrix[2,2]
+Accuracy = (TP + TN)/(TP + TN + FP + FN)
+FPR = FP/(FP+TN)
+TPR = TP/(TP+FP)
+TNR = TN/(TN+FP)
+FNR = FN/(FN+TP)
+c(Accuracy, FPR, TPR, TNR, FNR)
+#Accuracy = 0.914513678
+# We understand that, even after excluding the influence of confounding factors,
+# increase in songsListened has impact on becoming a paid subscriber
+
+
+#3) lovedTracks
+# First, we need to figure out the level of lovedTracks that subscribers have
+summary(df$lovedTracks)
+# mean = 101
+# construct a propensity score matching model to create a group with above the average listener
+# with loved tracks and listner with loved tracks below the average with other similar characteristics
+# to analyze whether this is a factor of being an adopter
+
+df.lovedTracks = mutate(df, lovedTracksAvg = ifelse(df$lovedTracks>=101,1,0))
+
+# Conduct propensity score matching to create a group with similar traits
+
+matchprocess.lovedTracks = matchit(lovedTracksAvg ~ .
+                                     -lovedTracks, data = df.lovedTracks, method = "nearest", ratio = 1)
+summary(matchprocess.lovedTracks)
+# Same number of control & treated group
+
+# Create a dataframe with matched data
+matchdata.lovedTracks<- match.data(matchprocess.lovedTracks) 
+table(matchdata.lovedTracks$adopter)
+table(matchdata.lovedTracks$lovedTracksAvg)
+# We know that the same number of subscribers who has more loved tracks than average 
+# and those who has below the average
+# Also 3460 subscribers out of 19630 subscribers in the dataset are adopters
+
+# Delete variables that are created in the process of propensity score matching
+matchdata.lovedTracks <- select(matchdata.lovedTracks, -distance, -weights, -subclass)
+View(matchdata.lovedTracks)
+
+#Conduct logistic regression on the created dataset
+idx <- sample.split(matchdata.lovedTracks$adopter, 0.7)
+md.lovedTracks.train = df[idx,]
+md.lovedTracks.test = df[!idx,]
+
+mod.lovedTracks <- glm(adopter~.,
+                         data = md.lovedTracks.train, family="binomial")
+summary(mod.lovedTracks)
+
+# Run the logistics regression on the test data
+pred4 = predict(mod.lovedTracks , newdata=md.lovedTracks.test, type="response")
+head(pred4)
+rocr.pred4 = prediction(pred4, md.lovedTracks.test$adopter)
+str(rocr.pred4)
+plot(performance(rocr.pred4, "tpr", "fpr"))
+
+AUC = as.numeric(performance(rocr.pred4, "auc")@y.values)
+AUC
+# AUC = 0.7433151
+
+# calculate accuracy of the model
+md.lovedTracks.test = mutate(md.lovedTracks.test, 
+                               Actual_adopter = ifelse(adopter == 1,"ActualAdopter","ActualNoAdopter"))
+md.lovedTracks.test = mutate(md.lovedTracks.test, predicted_probability = pred4)
+
+cutoff = 0.5
+md.lovedTracks.test = mutate(md.lovedTracks.test, 
+                               prediction = ifelse(predicted_probability > cutoff,"Predict_Adopter","Predict_NoAdopter"))
+confusion_matrix = table(md.lovedTracks.test$prediction, md.lovedTracks.test$Actual_adopter)
+confusion_matrix
+TP = confusion_matrix[1,1]
+FN = confusion_matrix[2,1]
+FP = confusion_matrix[1,2]
+TN = confusion_matrix[2,2]
+Accuracy = (TP + TN)/(TP + TN + FP + FN)
+FPR = FP/(FP+TN)
+TPR = TP/(TP+FP)
+TNR = TN/(TN+FP)
+FNR = FN/(FN+TP)
+c(Accuracy, FPR, TPR, TNR, FNR)
+#Accuracy = 0.917921174
+# We understand that, even after excluding the influence of confounding factors,
+# increase in lovedTracks has impact on becoming a paid subscriber
+
+#4) playlists
+# First, we need to figure out the number of playlists that subscribers have
+summary(df$playlists)
+# mean = 57, median = 0
+# construct a propensity score matching model to create a group with  listener
+# with playlists and listner without playlists with other similar characteristics
+# to analyze whether this is a factor of being an adopter
+
+df.playlists = mutate(df, have.playlists = ifelse(df$playlists>=1,1,0))
+
+# Conduct propensity score matching to create a group with similar traits
+
+matchprocess.playlists = matchit(have.playlists ~ .
+                                   -playlists, data = df.playlists, method = "nearest", ratio = 1)
+summary(matchprocess.playlists)
+
+# Create a dataframe with matched data
+matchdata.playlists<- match.data(matchprocess.playlists) 
+table(matchdata.playlists$adopter)
+table(matchdata.playlists$have.playlists)
+# We know that the same number of subscribers who has more loved tracks than average 
+# and those who has below the average
+# Also 3430 subscribers out of 40890 subscribers in the dataset are adopters
+
+# Delete variables that are created in the process of propensity score matching
+matchdata.playlists <- select(matchdata.playlists, -distance, -weights, -subclass)
+View(matchdata.playlists)
+
+#Conduct logistic regression on the created dataset
+idx <- sample.split(matchdata.playlists$adopter, 0.7)
+md.playlists.train = df[idx,]
+md.playlists.test = df[!idx,]
+
+mod.playlists <- glm(adopter~.,
+                       data = md.playlists.train, family="binomial")
+summary(mod.playlists)
+
+# Run the logistics regression on the test data
+pred5 = predict(mod.playlists , newdata=md.playlists.test, type="response")
+head(pred5)
+rocr.pred5 = prediction(pred5, md.playlists.test$adopter)
+str(rocr.pred5)
+plot(performance(rocr.pred5, "tpr", "fpr"))
+
+AUC = as.numeric(performance(rocr.pred5, "auc")@y.values)
+AUC
+# AUC = 0.7453429
+
+# calculate accuracy of the model
+md.playlists.test = mutate(md.playlists.test, 
+                             Actual_adopter = ifelse(adopter == 1,"ActualAdopter","ActualNoAdopter"))
+md.playlists.test = mutate(md.playlists.test, predicted_probability = pred5)
+
+cutoff = 0.5
+md.playlists.test = mutate(md.playlists.test, 
+                             prediction = ifelse(predicted_probability > cutoff,"Predict_Adopter","Predict_NoAdopter"))
+confusion_matrix = table(md.playlists.test$prediction, md.playlists.test$Actual_adopter)
+confusion_matrix
+TP = confusion_matrix[1,1]
+FN = confusion_matrix[2,1]
+FP = confusion_matrix[1,2]
+TN = confusion_matrix[2,2]
+Accuracy = (TP + TN)/(TP + TN + FP + FN)
+FPR = FP/(FP+TN)
+TPR = TP/(TP+FP)
+TNR = TN/(TN+FP)
+FNR = FN/(FN+TP)
+c(Accuracy, FPR, TPR, TNR, FNR)
+#Accuracy = 0.914922451
+# We understand that, even after excluding the influence of confounding factors,
+# increase in playlists has impact on becoming a paid subscriber
+
+###################################################################
+########### Step 4: Instrumental Variables ########################
+###################################################################
+
+# Analyze the four independent variables: subscriber_friend_cnt, songsListened, lovedTracks, playlists
+# using IV method
+
+library(AER)
+
+### Note: The four kinds of variables in IV
+
+ #  Y = outcome variable
+ #  X = endogenous variable(s)
+ #  Z = instrument(s)
+ #  W = any exogenous vars not including instruments
+ #  The general set-up is ivreg(Y ~ X + W | W + Z, ...)
+
+
+# 1) # Simultaneity bias between subscriber_friend_cnt and songsListened, lovedTracks, playlists
+
+# create a linear regression model using all the variables in the data frame
+lm.sfc.all = lm(subscriber_friend_cnt ~., data = df)
+summary(lm.sfc.all)
+
+# create a linear regression model using four variables in the data frame
+lm.sfc = lm(subscriber_friend_cnt ~ songsListened + lovedTracks + playlists, data = df)
+summary(lm.sfc)
+
+# We have determined that delta1_songsListened is a good instrumental variable for songsListened
+# We have determined that delta1_lovedTracks is a good instrumental variable for lovedTracks
+# We have determined that delta1_playlists is a good instrumental variable for playlists
+# IV regression to see the results excluding endogeneity
+ivmodel.sfc <- ivreg(subscriber_friend_cnt ~ songsListened + lovedTracks + playlists | delta1_songsListened + delta1_lovedTracks + delta1_playlists, data = df)
+summary(ivmodel.sfc)
+
+# Even if we exclude simultaneity, all songsListened, lovedTracks, playlists have significant impacts on subscriber_friend_cnt.
+
+# 2) # Simultaneity bias between songsListened and subscriber_friend_cnt, lovedTracks, playlists
+
+# create a linear regression model using four variables in the data frame
+
+lm.sl = lm(songsListened ~ subscriber_friend_cnt + lovedTracks + playlists, data = df)
+summary(lm.sl)
+
+# We have determined that delta1_subscriber_friend_cnt is a good instrumental variable for subscriber_friend_cnt
+# We have determined that delta1_lovedTracks is a good instrumental variable for lovedTracks
+# We have determined that delta1_playlists is a good instrumental variable for playlists
+# IV regression to see the results excluding endogeneity
+ivmodel.sl <- ivreg(songsListened ~ subscriber_friend_cnt + lovedTracks + playlists | delta1_subscriber_friend_cnt + delta1_lovedTracks + delta1_playlists, data = df)
+summary(ivmodel.sl)
+
+# By exclude simultaneity, both subscriber_friend_cnt and lovedTracks have significant impacts on songsListened.
+# However, playlists doesn't have a significant impact on songsListened if we exclude simultaneity
+
+# 3) # Simultaneity bias between lovedTracks and subscriber_friend_cnt, songsListened, playlists
+
+# create a linear regression model using four variables in the data frame
+
+lm.lt = lm(lovedTracks ~ subscriber_friend_cnt + songsListened + playlists, data = df)
+summary(lm.lt)
+
+# We have determined that delta1_subscriber_friend_cnt is a good instrumental variable for subscriber_friend_cnt
+# We have determined that delta1_songsListened is a good instrumental variable for songsListened
+# We have determined that delta1_playlists is a good instrumental variable for playlists
+# IV regression to see the results excluding endogeneity
+ivmodel.lt <- ivreg(lovedTracks ~ subscriber_friend_cnt + songsListened + playlists | delta1_subscriber_friend_cnt + delta1_songsListened + delta1_playlists, data = df)
+summary(ivmodel.lt)
+
+# By exclude simultaneity, both subscriber_friend_cnt and songsListened have significant impacts on songsListened.
+# However, playlists doesn't have a significant impact on lovedTracks if we exclude simultaneity
+
+
+# 4) # Simultaneity bias between playlists and subscriber_friend_cnt, songsListened, lovedTracks
+
+# create a linear regression model using four variables in the data frame
+
+lm.pl = lm(playlists ~ subscriber_friend_cnt + songsListened + lovedTracks, data = df)
+summary(lm.pl)
+
+# We have determined that delta1_subscriber_friend_cnt is a good instrumental variable for subscriber_friend_cnt
+# We have determined that delta1_songsListened is a good instrumental variable for songsListened
+# We have determined that delta1_lovedTracks is a good instrumental variable for lovedTracks
+# IV regression to see the results excluding endogeneity
+ivmodel.pl <- ivreg(playlists ~ subscriber_friend_cnt + songsListened + lovedTracks | delta1_subscriber_friend_cnt + delta1_songsListened + delta1_lovedTracks, data = df)
+summary(ivmodel.pl)
+
+# By exclude simultaneity, both subscriber_friend_cnt and lovedTracks have significant impacts on songsListened.
+# However, playlists doesn't have a significant impact on songsListened if we exclude simultaneity
+
+#### CONCLUSION FROM INSTRUMENTAL VARIABLES ANALYSIS #####
+# We found out that number of playlists made till the current period is 
+# recognized as important by the model because of endogeneity
+# Therefore, we would advise High Note that High Note should focus on
+# subscriber_friend_cnt, songsListened, lovedTracks
